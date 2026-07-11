@@ -8,13 +8,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Allowed shared-vCPU values.
-pub const ALLOWED_CPU: [f64; 4] = [0.5, 1.0, 2.0, 4.0];
-/// Allowed memory values in MB (0.5, 1, 2, 4, 8, 16 GB). The 512 MB shape exists
-/// for light, fast-standby sandboxes — its snapshot footprint is ~4× smaller
-/// than the base shape, so its first standby eviction is proportionally quicker.
-pub const ALLOWED_MEMORY_MB: [u32; 6] = [512, 1024, 2048, 4096, 8192, 16384];
+pub const ALLOWED_CPU: [f64; 5] = [0.25, 0.5, 1.0, 2.0, 4.0];
+/// Allowed memory values in MB (0.25, 0.5, 1, 2, 4, 8, 16 GB). The 512 MB shape
+/// exists for light, fast-standby sandboxes — its snapshot footprint is ~4×
+/// smaller than the base shape, so its first standby eviction is proportionally
+/// quicker. The 256 MB shape targets ultra-light agent sandboxes.
+pub const ALLOWED_MEMORY_MB: [u32; 7] = [256, 512, 1024, 2048, 4096, 8192, 16384];
 /// Allowed writable disk values in GB.
-pub const ALLOWED_DISK_GB: [u32; 4] = [8, 16, 32, 64];
+pub const ALLOWED_DISK_GB: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
 /// Auto-stop idle window bounds, in seconds.
 pub const AUTO_STOP_MIN_S: u32 = 30;
 pub const AUTO_STOP_MAX_S: u32 = 3600;
@@ -95,10 +96,27 @@ impl Resources {
 
     /// Human label used in API responses, e.g. "2 shared vCPU".
     pub fn cpu_label(&self) -> String {
-        if approx_eq(self.cpu, 0.5) {
+        if approx_eq(self.cpu, 0.25) {
+            "0.25 shared vCPU".to_string()
+        } else if approx_eq(self.cpu, 0.5) {
             "0.5 shared vCPU".to_string()
         } else {
             format!("{} shared vCPU", self.cpu as u32)
+        }
+    }
+
+    /// Compute the cgroup v2 `cpu.max` value for this CPU fraction.
+    ///
+    /// Format: `"<quota_us> <period_us>"` where period is 100000 (100 ms).
+    /// A `cpu` of 1.0 means no limit (returns `None`). Sub-1.0 values produce
+    /// a proportional quota: 0.25 → "25000 100000", 0.5 → "50000 100000".
+    pub fn cpu_max(&self) -> Option<String> {
+        if self.cpu >= 1.0 {
+            None
+        } else {
+            let period: u64 = 100_000; // 100 ms
+            let quota = (self.cpu * period as f64).round() as u64;
+            Some(format!("{quota} {period}"))
         }
     }
 }
@@ -149,6 +167,33 @@ mod tests {
     fn accepts_half_cpu() {
         let req = ResourcesRequest {
             cpu: Some(0.5),
+            ..Default::default()
+        };
+        assert!(Resources::validate(&req).is_ok());
+    }
+
+    #[test]
+    fn accepts_quarter_cpu() {
+        let req = ResourcesRequest {
+            cpu: Some(0.25),
+            ..Default::default()
+        };
+        assert!(Resources::validate(&req).is_ok());
+    }
+
+    #[test]
+    fn accepts_small_disk() {
+        let req = ResourcesRequest {
+            disk_gb: Some(1),
+            ..Default::default()
+        };
+        assert!(Resources::validate(&req).is_ok());
+    }
+
+    #[test]
+    fn accepts_tiny_memory() {
+        let req = ResourcesRequest {
+            memory_mb: Some(256),
             ..Default::default()
         };
         assert!(Resources::validate(&req).is_ok());

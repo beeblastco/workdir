@@ -30,7 +30,7 @@ echo "==> building image '$NAME' ($SIZE)"
 build=$(mktemp -d)
 cp "$SRC"/* "$build"/
 cp "$AGENT" "$build/sandbox-guest-agent"
-docker build -t "workdir-$NAME" "$build" >/dev/null
+docker build --network=host -t "workdir-$NAME" "$build" >/dev/null
 
 rootfs="$build/rootfs"
 mkdir -p "$rootfs"

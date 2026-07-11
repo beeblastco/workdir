@@ -65,11 +65,12 @@ impl ImageClass {
     pub fn minimum_resources(&self) -> Resources {
         match self {
             // Base can run as small as 512 MB for light, fast-standby workloads
-            // (the default cheap path is still 2 GB / 1.0 unit).
+            // (the default cheap path is still 2 GB / 1.0 unit). Disk minimum
+            // matches the base rootfs size (4 GB).
             ImageClass::Base => Resources {
-                cpu: 0.5,
+                cpu: 0.25,
                 memory_mb: 512,
-                disk_gb: 8,
+                disk_gb: 4,
             },
             ImageClass::NodePython => Resources {
                 cpu: 1.0,

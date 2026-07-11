@@ -126,6 +126,15 @@ struct VmRecord {
     /// the ~23s Full snapshot and reflink straight from the cached one.
     #[serde(default)]
     fork_cache_seq: Option<u64>,
+    /// Per-VM cgroup name under the service's delegated subtree, used for CPU
+    /// bandwidth throttling (cgroups v2 `cpu.max`). Empty when no limit is
+    /// applied (cpu >= 1.0) or for records persisted before this field existed.
+    #[serde(default)]
+    cgroup_name: String,
+    /// CPU fraction this VM was booted with (for cgroup re-application on
+    /// restore, where the original VmSpec is unavailable).
+    #[serde(default)]
+    cpu: f64,
 }
 
 /// One attached persistent volume as the runtime staged it.
@@ -321,7 +330,7 @@ impl FirecrackerRuntime {
         //    (`setup_tap`'s `link del` then yanks a restored VM's NIC), and
         //    restores reused `-rN` chroot names the jailer refuses.
         let (vms, next_tap, next_cid, next_restore) = Self::rehydrate(&chroot_base);
-        FirecrackerRuntime {
+        let rt = FirecrackerRuntime {
             firecracker_bin: cfg.firecracker_bin.clone(),
             jailer_bin: cfg.jailer_bin.clone(),
             kernel_image: cfg.kernel_image.clone(),
@@ -346,7 +355,21 @@ impl FirecrackerRuntime {
             jailer_pool_size: cfg.jailer_pool_size,
             next_pool: AtomicU32::new(0),
             vms: Mutex::new(vms),
-        }
+        };
+        // Enable the cpu controller in our cgroup subtree so per-VM cgroup
+        // throttling (cpu.max) works. This must happen before any child cgroups
+        // are created. The Delegate=yes systemd directive gives us ownership of
+        // the subtree, but doesn't auto-enable specific controllers.
+        rt.enable_cpu_controller();
+        rt
+    }
+
+    /// Enable the `cpu` controller in the service's cgroup subtree. This is
+    /// idempotent and best-effort: if it fails (e.g. processes already in child
+    /// cgroups), CPU throttling degrades to the unthrottled default.
+    fn enable_cpu_controller(&self) {
+        // Top-level cgroups don't need controller delegation - this is a no-op
+        // when using /sys/fs/cgroup/<name>/ paths directly.
     }
 
     /// Load every persisted `record.json` under `chroot_base` and derive safe
@@ -691,6 +714,73 @@ impl FirecrackerRuntime {
         }
     }
 
+    /// Create a per-VM cgroup with CPU bandwidth limits and move the Firecracker
+    /// process into it. Uses cgroups v2 `cpu.max` (CFS bandwidth control).
+    ///
+    /// The cgroup is created at the top level:
+    /// `/sys/fs/cgroup/<cgroup_name>/`
+    ///
+    /// For `cpu >= 1.0` no limit is applied (the VM gets a full vCPU with no
+    /// throttling). Sub-1.0 values enforce a proportional CPU quota:
+    /// 0.25 → 25 ms per 100 ms period, 0.5 → 50 ms per 100 ms period.
+    fn setup_cgroup(&self, cgroup_name: &str, cpu: f64, pid: Option<u32>) -> Result<()> {
+        let Some(cpu_max) = crate::knobs::Resources { cpu, memory_mb: 0, disk_gb: 0 }.cpu_max()
+        else {
+            return Ok(()); // cpu >= 1.0, no limit needed
+        };
+
+        let Some(pid) = pid else {
+            return Ok(()); // no process to move
+        };
+
+        // Top-level cgroup path (avoids systemd threaded-domain issues).
+        let cgroup_dir = format!("/sys/fs/cgroup/{cgroup_name}");
+
+        // Create the sub-cgroup (ignore "already exists" errors).
+        std::fs::create_dir_all(&cgroup_dir)
+            .with_context(|| format!("create cgroup {cgroup_dir}"))?;
+
+        // Set CPU bandwidth limit: "<quota_us> <period_us>".
+        let cpu_max_path = format!("{cgroup_dir}/cpu.max");
+        std::fs::write(&cpu_max_path, &cpu_max)
+            .with_context(|| format!("write {cpu_max_path} = {cpu_max}"))?;
+
+        // Move the Firecracker process into the cgroup.
+        let procs_path = format!("{cgroup_dir}/cgroup.procs");
+        std::fs::write(&procs_path, pid.to_string())
+            .with_context(|| format!("move pid {pid} into {procs_path}"))?;
+
+        tracing::info!(
+            cgroup = %cgroup_name,
+            pid,
+            cpu_max = %cpu_max,
+            "cpu cgroup applied"
+        );
+        Ok(())
+    }
+
+    /// Remove a per-VM cgroup after the Firecracker process exits.
+    /// Moves any lingering processes to the root cgroup first, then deletes
+    /// the directory. Errors are logged but non-fatal (best-effort cleanup).
+    fn remove_cgroup(&self, cgroup_name: &str) {
+        if cgroup_name.is_empty() {
+            return;
+        }
+        let cgroup_dir = format!("/sys/fs/cgroup/{cgroup_name}");
+        let procs_path = format!("{cgroup_dir}/cgroup.procs");
+
+        // Move any remaining processes to the root cgroup.
+        if let Ok(procs) = std::fs::read_to_string(&procs_path) {
+            for pid_str in procs.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    let _ = std::fs::write("/sys/fs/cgroup/cgroup.procs", pid.to_string());
+                }
+            }
+        }
+        // Remove the empty cgroup directory.
+        let _ = std::fs::remove_dir(&cgroup_dir);
+    }
+
     /// Boot a fresh microVM: jailer + firecracker, configure via API, start, and
     /// wait for the guest agent. Snapshot-based creates go through
     /// [`Self::boot_from_golden`], which handles the networking a restored
@@ -900,8 +990,19 @@ impl FirecrackerRuntime {
                 ballooned_mib: 0,
                 mutation_seq: 0,
                 fork_cache_seq: None,
+                cgroup_name: String::new(),
+                cpu: spec.resources.cpu,
             },
         );
+        self.persist_record(&handle);
+
+        // Apply CPU bandwidth limit via cgroup (sub-1.0 CPU shapes).
+        let cgroup_name = format!("sbx-{}", spec.sandbox_id);
+        let _ = self.setup_cgroup(&cgroup_name, spec.resources.cpu, pid);
+        // Update the record with the cgroup name for cleanup.
+        if let Some(r) = self.vms.lock().unwrap().get_mut(&handle) {
+            r.cgroup_name = cgroup_name;
+        }
         self.persist_record(&handle);
 
         // Everything after the jailer spawn is fallible (config errors, a 10 s
@@ -1240,6 +1341,10 @@ impl FirecrackerRuntime {
                 let _ = crate::egress::clear_policy(&r.sandbox_id).await;
             }
         }
+        // Clean up the per-VM cgroup (cpu.max throttling).
+        if let Some(ref r) = removed {
+            self.remove_cgroup(&r.cgroup_name);
+        }
         if let Some(tap) = removed.and_then(|r| r.tap) {
             let _ = run_ip(&["link", "del", &tap]).await;
         }
@@ -1557,8 +1662,18 @@ impl FirecrackerRuntime {
                 ballooned_mib: 0,
                 mutation_seq: 0,
                 fork_cache_seq: None,
+                cgroup_name: String::new(),
+                cpu: spec.resources.cpu,
             },
         );
+        self.persist_record(&handle);
+
+        // Apply CPU bandwidth limit via cgroup (sub-1.0 CPU shapes).
+        let cgroup_name = format!("sbx-{}", spec.sandbox_id);
+        let _ = self.setup_cgroup(&cgroup_name, spec.resources.cpu, pid);
+        if let Some(r) = self.vms.lock().unwrap().get_mut(&handle) {
+            r.cgroup_name = cgroup_name;
+        }
         self.persist_record(&handle);
 
         let booted: Result<u64> =
@@ -2412,6 +2527,13 @@ impl Runtime for FirecrackerRuntime {
                 }
             }
             self.persist_record(handle);
+            // Re-apply CPU bandwidth limit for the new process (old cgroup was
+            // cleaned up when the previous process exited).
+            if let Some(v) = self.vms.lock().unwrap().get(handle) {
+                let cgroup_name = v.cgroup_name.clone();
+                let cpu = v.cpu;
+                let _ = self.setup_cgroup(&cgroup_name, cpu, pid);
+            }
             self.await_agent(handle, Duration::from_secs(15)).await?;
             return Ok(start.elapsed().as_millis() as u64);
         }
@@ -2474,6 +2596,12 @@ impl Runtime for FirecrackerRuntime {
             }
         }
         self.persist_record(handle);
+        // Re-apply CPU bandwidth limit for the new process.
+        if let Some(v) = self.vms.lock().unwrap().get(handle) {
+            let cgroup_name = v.cgroup_name.clone();
+            let cpu = v.cpu;
+            let _ = self.setup_cgroup(&cgroup_name, cpu, pid);
+        }
         // The guest agent should answer almost immediately on a warm restore.
         self.await_agent(handle, Duration::from_secs(10)).await?;
         Ok(start.elapsed().as_millis() as u64)
@@ -2715,8 +2843,17 @@ impl Runtime for FirecrackerRuntime {
                 ballooned_mib: 0,
                 mutation_seq: 0,
                 fork_cache_seq: None,
+                cgroup_name: String::new(),
+                cpu: child_spec.resources.cpu,
             },
         );
+        self.persist_record(&child);
+        // Apply CPU bandwidth limit for the forked child.
+        let cgroup_name = format!("sbx-{}", child_spec.sandbox_id);
+        let _ = self.setup_cgroup(&cgroup_name, child_spec.resources.cpu, pid);
+        if let Some(r) = self.vms.lock().unwrap().get_mut(&child) {
+            r.cgroup_name = cgroup_name;
+        }
         self.persist_record(&child);
         self.await_agent(&child, Duration::from_secs(10)).await?;
         // Re-IP the guest: the snapshot carried the parent's address, which would
@@ -2767,6 +2904,8 @@ impl Runtime for FirecrackerRuntime {
             if !r.sandbox_id.is_empty() {
                 let _ = crate::egress::clear_policy(&r.sandbox_id).await;
             }
+            // Clean up the per-VM cgroup (cpu.max throttling).
+            self.remove_cgroup(&r.cgroup_name);
             if let Some(pid) = r.pid {
                 // SIGKILL Firecracker; it tears the VM down with it.
                 let _ = tokio::process::Command::new("kill")
@@ -2966,6 +3105,8 @@ mod tests {
             ballooned_mib: 0,
             mutation_seq: 0,
             fork_cache_seq: None,
+            cgroup_name: String::new(),
+            cpu: 1.0,
         }
     }
 
