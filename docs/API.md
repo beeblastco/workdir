@@ -13,7 +13,9 @@ The default create is one call with no body and yields the cheapest, fastest pat
 | `POST` | `/v1/sandboxes` | Create. Empty body = default cheap path. |
 | `GET` | `/v1/sandboxes` | List the caller's sandboxes. |
 | `GET` | `/v1/sandboxes/:id` | Get one (with timings, urls, price, uptime, cost). |
-| `POST` | `/v1/sandboxes/:id/exec` | `{cmd, cwd?, env?, background?}` → `{exit_code, stdout, stderr}`. |
+| `POST` | `/v1/sandboxes/:id/exec` | `{cmd, cwd?, env?, background?}` → sync `{exit_code, stdout, stderr}` or, with `background: true`, `202 {cmd_id, state, status_url, logs_url}`. |
+| `GET` | `/v1/sandboxes/:id/exec/:cmd_id` | Poll background exec status → `{state, exit_code?, started_at, finished_at?, error?}`. |
+| `GET` | `/v1/sandboxes/:id/exec/:cmd_id/logs` | Fetch captured background exec output → `{stdout, stderr, truncated}`. |
 | `GET` | `/v1/sandboxes/:id/pty` | WebSocket interactive shell (a real in-guest TTY over vsock on Firecracker). |
 | `GET` | `/v1/sandboxes/:id/metrics` | Working-set metrics: host RSS vs reserved shape, balloon target + guest memory stats, net counters. |
 | `GET` | `/v1/sandboxes/:id/files?path=…` | Read a file → `{content, encoding}`. |
@@ -26,6 +28,93 @@ The default create is one call with no body and yields the cheapest, fastest pat
 | `POST` | `/v1/sandboxes/:id/pause` | Stop (release CPU/mem; keep billing correct). |
 | `POST` | `/v1/sandboxes/:id/resume` | Resume from stopped disk/snapshot. |
 | `DELETE` | `/v1/sandboxes/:id` | Stop, delete ephemeral disk, remove routes. |
+
+## Templates
+
+Org-scoped named sandbox create configs. A template's `create` field is the same
+JSON body accepted by `POST /v1/sandboxes`.
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/templates` | `{name, description?, create}` → store a named create config. |
+| `GET` | `/v1/templates` | List the caller's templates. |
+| `GET` | `/v1/templates/:name` | Get one template. |
+| `PUT` | `/v1/templates/:name` | Replace `description` + `create`. |
+| `DELETE` | `/v1/templates/:name` | Delete one template. |
+| `POST` | `/v1/templates/:name/sandboxes` | `{count?, overrides?}` → create 1–20 fresh sandboxes from the template. |
+
+```jsonc
+{
+  "name": "node-app",
+  "create": {
+    "image": "node-python",
+    "resources": { "cpu": 2, "memory_mb": 4096, "disk_gb": 16 },
+    "startup": {
+      "git": { "url": "https://github.com/acme/app.git", "ref": "main" },
+      "commands": [{ "name": "install", "run": "pnpm install --frozen-lockfile" }],
+      "ports": [3000]
+    }
+  }
+}
+```
+
+## Agent runs
+
+Agent runs create a sandbox from a template or hardness profile, run Codex or
+Claude Code inside it, collect a staged git diff, and optionally open a GitHub
+PR from the control plane. They also produce a backend-generated report for
+main-agent orchestration. Provider keys and GitHub tokens are referenced by
+secret name; secret values are never returned.
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/agent-runs` | Start an async run → `202 {id, state, status_url, logs_url}`. |
+| `GET` | `/v1/agent-runs` | List runs with compact report fields. Supports `parent_run_id`, `label`, and `state` filters. |
+| `GET` | `/v1/agent-runs/:id` | Status, sandbox id, report, branch/commit/PR URL, error. |
+| `GET` | `/v1/agent-runs/:id/report` | Backend-generated run report. |
+| `GET` | `/v1/agent-runs/:id/children` | Runs whose `task.parent_run_id` is this id, with compact report fields. |
+| `POST` | `/v1/agent-runs/:id/cancel` | Cooperatively cancel a queued/running run. |
+| `GET` | `/v1/agent-runs/:id/logs` | Captured stdout/stderr and staged diff. |
+
+```jsonc
+{
+  "template": "node-app",
+  "repo": { "url": "https://github.com/acme/app.git", "ref": "main" },
+  "agent": "codex",                  // codex | claude_code
+  "model": "gpt-5",
+  "api_key_secret": "OPENAI_API_KEY",
+  "prompt": "Fix the failing tests and keep the change minimal.",
+  "hardness": "medium",              // easy | medium | hard
+  "task": { "name": "Fix auth test failures", "labels": ["auth", "delegated"] },
+  "mode": "change",                  // change | review
+  "loop": { "goal": "Fix the failing tests and leave the repo with a clean diff.", "max_iterations": 2 },
+  "constraints": { "allowed_paths": ["src/auth", "tests/auth"], "max_changed_files": 8 },
+  "context": { "instructions": "Keep the public API stable." },
+  "verify": [{ "name": "auth tests", "run": "cargo test auth", "fail_run": true }],
+  "github": { "token_secret": "GITHUB_TOKEN", "base_branch": "main", "draft": true }
+}
+```
+
+If `github.token_secret` is omitted, the run stops after collecting the diff.
+When present, the token is used only by the control plane to create the branch,
+commit, push, and PR; it is not injected into the sandbox.
+
+`api_key_secret` names the stored provider key. Workdir maps that value to the
+selected CLI's required environment variable (`CODEX_API_KEY` for Codex,
+`ANTHROPIC_API_KEY` for Claude Code) when it starts the agent.
+
+Agent prompts and loop goals should ask the agent to modify files in the cloned
+repo. The sandbox agent should not commit, push, or create the PR; Workdir does
+that headlessly from the collected diff.
+
+Use `mode: "review"` for inspection-only subtasks. Review runs do not require a
+diff or PR. Reports include outcome, summary, changed files, verification
+results, artifacts from `.workdir/artifacts/`, constraints, branch/commit/PR,
+and stdout/stderr tails.
+
+List and children endpoints return compact report summaries for orchestration
+dashboards. Use `GET /v1/agent-runs/:id/report` when a delegating agent needs
+the full authoritative report.
 
 ### Lifecycle & perpetual standby
 
@@ -41,6 +130,8 @@ plus `deleting → deleted` and `failed`.
   first call. To the user the sandbox stays alive; it simply stops costing
   anything while idle. (Sandboxes with resident secrets are never snapshotted, so
   they fall back to a plain `stopped` instead.)
+- Running background exec jobs keep the sandbox out of automatic standby until
+  the tracked command exits.
 
 ### Create request
 
@@ -137,9 +228,9 @@ rejected with `400 bad_request`:
   "snapshot_enabled": false,
   "timings": { "boot_ms": 42, "image_cache_ms": 0, "git_ms": 0,
                "install_ms": 0, "ready_ms": 0, "total_ms": 43 },
-  "urls": { "ports": { "3000": "https://sbx_…-3000.<domain>" },
-            "vnc": "https://sbx_…-6080.<domain>",
-            "cdp": "https://sbx_…-9222.<domain>" },
+  "urls": { "ports": { "3000": "https://sbx-…-3000.<domain>" },
+            "vnc": "https://sbx-…-6080.<domain>",
+            "cdp": "https://sbx-…-9222.<domain>" },
   "mounts": [],
   "volumes": [],
   "network": { "egress": "default" },
@@ -257,10 +348,13 @@ carries the Phase 2 targets (`p50 < 25ms`, `p90 < 50ms`), surfaced under
 
 ## Preview proxy (spec §16.2)
 
-Host-routed: `https://<sandbox-id>-<port>.<domain>/…`. HTTP is forwarded;
-WebSocket/CDP/VNC upgrades are bridged. Requires a valid API key (header or
-`?key=`) belonging to the sandbox's org. A path-based form
-`/_preview/<id>/<port>/<rest>` exists for environments without wildcard DNS.
+Host-routed: `https://<hostname-safe-id>-<port>.<domain>/…` (sandbox ids render
+their `sbx_` prefix as `sbx-` in the DNS label). HTTP is forwarded;
+WebSocket/CDP/VNC upgrades are bridged. Requires a valid API key (header,
+`?key=`, or the preview cookie set by an earlier `?key=` request) belonging to
+the sandbox's org. A path-based form `/_preview/<id>/<port>/<rest>` exists for
+environments without wildcard DNS; use `/_preview/<id>/<port>` for the upstream
+root path.
 
 ### Driving the browser over CDP
 
@@ -275,6 +369,13 @@ header. An unauthenticated request returns `404` by design — existence is neve
 leaked across orgs. The `key=` param is stripped before the request reaches
 Chrome and redacted from logs, so it is safe in the URL; prefer it for WebSocket
 clients that cannot set headers on the upgrade.
+
+When a browser request authenticates with `?key=`, the proxy also returns an
+HttpOnly, Secure, SameSite preview cookie scoped to that preview host. Follow-up
+subresource requests and WebSocket upgrades can then authenticate without
+rewriting every URL. The proxy strips that preview cookie before forwarding to
+the sandbox, and it also blocks a sandbox from setting the reserved preview
+cookie name in upstream responses.
 
 ```js
 import { chromium } from "playwright";

@@ -1,6 +1,6 @@
 {
   "name": "@mv37/workdir",
-  "version": "0.1.0",
+  "version": "0.3.2",
   "description": "TypeScript SDK for workdir",
   "type": "module",
   "main": "./dist/index.js",

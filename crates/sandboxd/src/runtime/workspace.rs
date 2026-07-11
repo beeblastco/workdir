@@ -29,7 +29,10 @@ impl Workspaces {
     /// file API can never escape it. Leading `/` is treated as workspace-root.
     pub fn resolve(&self, handle: &str, guest_path: &str) -> Result<PathBuf> {
         let base = self.dir_for(handle).join("workspace");
-        let rel = guest_path.trim_start_matches('/');
+        let rel = guest_path
+            .strip_prefix("/workspace/")
+            .or_else(|| (guest_path == "/workspace").then_some(""))
+            .unwrap_or_else(|| guest_path.trim_start_matches('/'));
         let candidate = base.join(rel);
         // Defend against `..` traversal.
         let normalized = normalize(&candidate);
@@ -73,6 +76,14 @@ mod tests {
         let ws = Workspaces::new(&tmp);
         ws.create("sbx_x").unwrap();
         assert!(ws.resolve("sbx_x", "a/b.txt").is_ok());
+        assert_eq!(
+            ws.resolve("sbx_x", "/workspace").unwrap(),
+            ws.dir_for("sbx_x").join("workspace")
+        );
+        assert_eq!(
+            ws.resolve("sbx_x", "/workspace/a.txt").unwrap(),
+            ws.dir_for("sbx_x").join("workspace/a.txt")
+        );
         assert!(ws.resolve("sbx_x", "../../etc/passwd").is_err());
         ws.remove("sbx_x").ok();
     }

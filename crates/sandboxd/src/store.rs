@@ -6,7 +6,7 @@
 
 use crate::images::{CustomImage, ImageStatus};
 use crate::lifecycle::State;
-use crate::model::Sandbox;
+use crate::model::{AgentRun, AgentRunState, ExecJob, ExecJobState, Sandbox, SandboxTemplate};
 use crate::nodes::Node;
 use crate::usage::{ApiKey, Org, UsageInterval};
 use anyhow::{Context, Result};
@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS sandboxes (
 CREATE INDEX IF NOT EXISTS idx_sandboxes_org   ON sandboxes(org_id);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_node  ON sandboxes(node_id);
 CREATE INDEX IF NOT EXISTS idx_sandboxes_state ON sandboxes(state);
+CREATE TABLE IF NOT EXISTS exec_jobs (
+    id         TEXT PRIMARY KEY,
+    sandbox_id TEXT NOT NULL,
+    org_id     TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    data       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exec_jobs_sandbox ON exec_jobs(sandbox_id);
+CREATE INDEX IF NOT EXISTS idx_exec_jobs_org ON exec_jobs(org_id);
+CREATE INDEX IF NOT EXISTS idx_exec_jobs_state ON exec_jobs(state);
 CREATE TABLE IF NOT EXISTS images (
     id      TEXT PRIMARY KEY,
     org_id  TEXT NOT NULL,
@@ -90,6 +101,25 @@ CREATE TABLE IF NOT EXISTS volumes (
 );
 CREATE INDEX IF NOT EXISTS idx_volumes_org ON volumes(org_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_volumes_org_name ON volumes(org_id, name);
+CREATE TABLE IF NOT EXISTS templates (
+    id         TEXT PRIMARY KEY,
+    org_id     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    data       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_templates_org ON templates(org_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_templates_org_name ON templates(org_id, name);
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id         TEXT PRIMARY KEY,
+    org_id     TEXT NOT NULL,
+    sandbox_id TEXT,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    data       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_org ON agent_runs(org_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_sandbox ON agent_runs(sandbox_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_state ON agent_runs(state);
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +419,71 @@ impl Store {
         Ok(out)
     }
 
+    // --- exec jobs --------------------------------------------------------
+
+    pub fn put_exec_job(&self, job: &ExecJob) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO exec_jobs(id, sandbox_id, org_id, state, created_at, data)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                sandbox_id=excluded.sandbox_id, org_id=excluded.org_id,
+                state=excluded.state, data=excluded.data",
+            params![
+                job.id,
+                job.sandbox_id,
+                job.org_id,
+                job.state.as_str(),
+                job.started_at.to_rfc3339(),
+                serde_json::to_string(job)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_exec_job(&self, id: &str) -> Result<Option<ExecJob>> {
+        let conn = self.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT data FROM exec_jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.map(|d| serde_json::from_str(&d)).transpose()?)
+    }
+
+    pub fn has_running_exec_jobs(&self, sandbox_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM exec_jobs WHERE sandbox_id = ?1 AND state = 'running'",
+            params![sandbox_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn reconcile_interrupted_exec_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, data FROM exec_jobs WHERE state = 'running'")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let count = rows.len();
+        for (id, data) in rows {
+            let mut job: ExecJob = serde_json::from_str(&data)?;
+            job.state = ExecJobState::Failed;
+            job.error = Some("interrupted by control-plane restart".to_string());
+            job.finished_at = Some(now);
+            conn.execute(
+                "UPDATE exec_jobs SET state = 'failed', data = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&job)?],
+            )?;
+        }
+        Ok(count)
+    }
+
     // --- images ---------------------------------------------------------
 
     pub fn put_image(&self, img: &CustomImage) -> Result<()> {
@@ -650,6 +745,134 @@ impl Store {
         Ok(n > 0)
     }
 
+    // --- sandbox templates ----------------------------------------------
+
+    pub fn put_template(&self, t: &SandboxTemplate) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO templates(id, org_id, name, data) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                org_id=excluded.org_id, name=excluded.name, data=excluded.data",
+            params![t.id, t.org_id, t.name, serde_json::to_string(t)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_template(&self, id: &str) -> Result<Option<SandboxTemplate>> {
+        let conn = self.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT data FROM templates WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.map(|d| serde_json::from_str(&d)).transpose()?)
+    }
+
+    pub fn get_template_by_name(
+        &self,
+        org_id: &str,
+        name: &str,
+    ) -> Result<Option<SandboxTemplate>> {
+        let conn = self.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT data FROM templates WHERE org_id = ?1 AND name = ?2",
+                params![org_id, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.map(|d| serde_json::from_str(&d)).transpose()?)
+    }
+
+    pub fn list_templates_for_org(&self, org_id: &str) -> Result<Vec<SandboxTemplate>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT data FROM templates WHERE org_id = ?1 ORDER BY name")?;
+        let rows = stmt.query_map(params![org_id], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_template(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute("DELETE FROM templates WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    // --- agent runs ------------------------------------------------------
+
+    pub fn put_agent_run(&self, run: &AgentRun) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO agent_runs(id, org_id, sandbox_id, state, created_at, data)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                org_id=excluded.org_id, sandbox_id=excluded.sandbox_id,
+                state=excluded.state, data=excluded.data",
+            params![
+                run.id,
+                run.org_id,
+                run.sandbox_id,
+                run.state.as_str(),
+                run.created_at.to_rfc3339(),
+                serde_json::to_string(run)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_agent_run(&self, id: &str) -> Result<Option<AgentRun>> {
+        let conn = self.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT data FROM agent_runs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.map(|d| serde_json::from_str(&d)).transpose()?)
+    }
+
+    pub fn list_agent_runs_for_org(&self, org_id: &str) -> Result<Vec<AgentRun>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT data FROM agent_runs WHERE org_id = ?1 ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(params![org_id], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
+    pub fn reconcile_interrupted_agent_runs(&self, now: DateTime<Utc>) -> Result<usize> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, data FROM agent_runs WHERE state IN ('queued','running')")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(stmt);
+        let count = rows.len();
+        for (id, data) in rows {
+            let mut run: AgentRun = serde_json::from_str(&data)?;
+            run.state = AgentRunState::Failed;
+            run.error = Some("interrupted by control-plane restart".to_string());
+            run.updated_at = now;
+            run.finished_at = Some(now);
+            conn.execute(
+                "UPDATE agent_runs SET state = 'failed', data = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&run)?],
+            )?;
+        }
+        Ok(count)
+    }
+
     // --- benchmark samples (roadmap Phase 0) ----------------------------
 
     pub fn put_benchmark_sample(&self, s: &crate::bench::BenchmarkSample) -> Result<()> {
@@ -733,7 +956,9 @@ pub fn is_state_active(state: State) -> bool {
 #[cfg(test)]
 mod volume_tests {
     use super::*;
-    use crate::model::Volume;
+    use crate::model::{
+        AgentKind, AgentRepoSpec, AgentRun, AgentRunState, Hardness, SandboxTemplate, Volume,
+    };
     use chrono::Utc;
 
     fn vol(id: &str, org: &str, name: &str) -> Volume {
@@ -793,5 +1018,91 @@ mod volume_tests {
             "ext4 labels are capped at 16 bytes, got {}",
             l.len()
         );
+    }
+
+    #[test]
+    fn template_crud_and_org_scope() {
+        let s = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let t = SandboxTemplate {
+            id: "tmpl_a".into(),
+            org_id: "org1".into(),
+            name: "node-app".into(),
+            description: Some("desc".into()),
+            create: serde_json::json!({"startup": "none"}),
+            created_at: now,
+            updated_at: now,
+        };
+        s.put_template(&t).unwrap();
+        assert_eq!(s.get_template("tmpl_a").unwrap().unwrap().name, "node-app");
+        assert_eq!(
+            s.get_template_by_name("org1", "node-app")
+                .unwrap()
+                .unwrap()
+                .id,
+            "tmpl_a"
+        );
+        assert!(s
+            .get_template_by_name("org2", "node-app")
+            .unwrap()
+            .is_none());
+        assert_eq!(s.list_templates_for_org("org1").unwrap().len(), 1);
+        assert!(s.delete_template("tmpl_a").unwrap());
+        assert!(s.get_template("tmpl_a").unwrap().is_none());
+    }
+
+    #[test]
+    fn agent_run_persistence_and_reconcile() {
+        let s = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let run = AgentRun {
+            id: "arun_a".into(),
+            org_id: "org1".into(),
+            state: AgentRunState::Running,
+            sandbox_id: Some("sbx_a".into()),
+            template: Some("node-app".into()),
+            repo: AgentRepoSpec {
+                url: "https://github.com/acme/app.git".into(),
+                r#ref: Some("main".into()),
+            },
+            prompt: "fix it".into(),
+            model: "gpt-5".into(),
+            agent: AgentKind::Codex,
+            api_key_secret: "OPENAI_API_KEY".into(),
+            hardness: Hardness::Medium,
+            r#loop: Default::default(),
+            github: None,
+            task: Default::default(),
+            mode: Default::default(),
+            constraints: Default::default(),
+            context: Default::default(),
+            verify: Vec::new(),
+            verification_results: Vec::new(),
+            artifacts: Vec::new(),
+            constraint_result: None,
+            report: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            diff: String::new(),
+            logs_truncated: false,
+            verification_result: None,
+            branch: None,
+            commit: None,
+            pr_url: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        };
+        s.put_agent_run(&run).unwrap();
+        assert_eq!(s.list_agent_runs_for_org("org1").unwrap().len(), 1);
+        assert_eq!(
+            s.get_agent_run("arun_a").unwrap().unwrap().state,
+            AgentRunState::Running
+        );
+        assert_eq!(s.reconcile_interrupted_agent_runs(Utc::now()).unwrap(), 1);
+        let reconciled = s.get_agent_run("arun_a").unwrap().unwrap();
+        assert_eq!(reconciled.state, AgentRunState::Failed);
+        assert!(reconciled.error.unwrap().contains("interrupted"));
     }
 }

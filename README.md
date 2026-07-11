@@ -80,6 +80,19 @@ print(box.exec("python3 -c 'print(2+2)'").stdout)   # "4"
 box.delete()
 ```
 
+### Async exec jobs
+
+```ts
+const job = await box.exec("npm test", { background: true });
+let status = await box.execStatus(job.cmd_id);
+while (status.state === "running") {
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  status = await box.execStatus(job.cmd_id);
+}
+const logs = await box.execLogs(job.cmd_id);
+console.log(status.exit_code, logs.stdout);
+```
+
 ### A real workload — clone, install, preview
 
 ```ts
@@ -96,7 +109,9 @@ const box = await workdir.sandboxes.create({
   },
 });
 
-console.log(box.urls.ports["3000"]);   // public preview URL, served through an authenticated proxy
+// Public preview URL. The first ?key= request seeds an HttpOnly preview cookie
+// so browser subresources and WebSocket upgrades stay authenticated.
+console.log(box.urls.ports["3000"]);
 ```
 
 ### Feature examples
@@ -154,6 +169,48 @@ box = wd.sandboxes.create(
 )
 box.exec("opencode run 'add a regression test'")
 ```
+
+#### Templates and agent PR runs
+
+```ts
+await wd.templates.create({
+  name: "node-app",
+  create: {
+    image: "node-python",
+    resources: { cpu: 2, memory_mb: 4096, disk_gb: 16 },
+    startup: {
+      git: { url: "https://github.com/acme/app.git", ref: "main" },
+      commands: [{ name: "install", run: "pnpm install --frozen-lockfile" }],
+    },
+  },
+});
+const boxes = await wd.templates.spawn("node-app", { count: 3 });
+
+await wd.secrets.set("OPENAI_API_KEY", process.env.OPENAI_API_KEY!);
+await wd.secrets.set("GITHUB_TOKEN", process.env.GITHUB_TOKEN!);
+const run = await wd.agentRuns.create({
+  template: "node-app",
+  repo: { url: "https://github.com/acme/app.git", ref: "main" },
+  agent: "codex",
+  model: "gpt-5",
+  api_key_secret: "OPENAI_API_KEY",
+  prompt: "Fix the failing tests and leave a clean diff.",
+  task: { name: "Fix failing tests", labels: ["delegated"] },
+  constraints: { max_changed_files: 8 },
+  verify: [{ name: "tests", run: "pnpm test", fail_run: true }],
+  github: { token_secret: "GITHUB_TOKEN", draft: true },
+});
+const finished = await wd.agentRuns.wait(run.id);
+const report = await wd.agentRuns.report(finished.id);
+console.log(report.summary, finished.pr_url);
+```
+
+`api_key_secret` is the Workdir secret name containing the provider key. Workdir
+maps it to the CLI-specific environment variable for the selected agent
+(`CODEX_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude Code). The GitHub
+token is used only by the control plane to create the branch and PR. Main agents
+can pass `task.parent_run_id` and read `agentRuns.children(id)` to reconcile
+delegated subtasks.
 
 #### Network egress policy
 

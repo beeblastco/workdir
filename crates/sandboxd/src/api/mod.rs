@@ -3,6 +3,7 @@
 //! fallback (spec §16.2).
 
 pub mod admin;
+pub mod agent_runs;
 pub mod images;
 pub mod internal;
 pub mod nodes;
@@ -10,6 +11,7 @@ pub mod preview;
 pub mod pty;
 pub mod sandboxes;
 pub mod secrets;
+pub mod templates;
 pub mod usage;
 pub mod volumes;
 
@@ -33,6 +35,11 @@ pub fn router(state: AppState) -> Router {
             get(sandboxes::get).delete(sandboxes::delete),
         )
         .route("/sandboxes/:id/exec", post(sandboxes::exec))
+        .route("/sandboxes/:id/exec/:cmd_id", get(sandboxes::exec_status))
+        .route(
+            "/sandboxes/:id/exec/:cmd_id/logs",
+            get(sandboxes::exec_logs),
+        )
         .route("/sandboxes/:id/metrics", get(sandboxes::metrics))
         .route("/sandboxes/:id/pty", get(pty::pty_ws))
         .route(
@@ -62,6 +69,17 @@ pub fn router(state: AppState) -> Router {
         .route("/nodes/:id/drain", post(nodes::drain))
         .route("/secrets", get(secrets::list))
         .route("/secrets/:name", put(secrets::put).delete(secrets::delete))
+        .route("/templates", get(templates::list).post(templates::create))
+        .route(
+            "/templates/:name",
+            get(templates::get)
+                .put(templates::update)
+                .delete(templates::delete),
+        )
+        .route(
+            "/templates/:name/sandboxes",
+            post(templates::spawn_sandboxes),
+        )
         .route("/volumes", get(volumes::list).post(volumes::create))
         .route("/volumes/:id", get(volumes::get).delete(volumes::delete))
         .route("/usage", get(usage::usage))
@@ -94,6 +112,15 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/keys/:hash", delete(admin::revoke_key))
         .route("/benchmarks", get(usage::benchmarks))
         .route("/benchmarks/run", post(usage::run_benchmarks))
+        .route(
+            "/agent-runs",
+            get(agent_runs::list).post(agent_runs::create),
+        )
+        .route("/agent-runs/:id", get(agent_runs::get))
+        .route("/agent-runs/:id/report", get(agent_runs::report))
+        .route("/agent-runs/:id/children", get(agent_runs::children))
+        .route("/agent-runs/:id/cancel", post(agent_runs::cancel))
+        .route("/agent-runs/:id/logs", get(agent_runs::logs))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw));
 
     Router::new()

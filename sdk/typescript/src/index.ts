@@ -89,6 +89,178 @@ export interface ExecResult {
   stderr: string;
 }
 
+export interface ExecJob {
+  cmd_id: string;
+  state: "running" | "exited" | "failed" | string;
+  exit_code?: number | null;
+  started_at: string;
+  finished_at?: string | null;
+  error?: string | null;
+  logs_truncated?: boolean;
+  status_url?: string;
+  logs_url?: string;
+}
+
+export interface ExecLogs {
+  cmd_id: string;
+  state: string;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+}
+
+export interface SandboxTemplate {
+  id: string;
+  name: string;
+  description?: string | null;
+  create: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentRunRequest {
+  template?: string;
+  repo: { url: string; ref?: string };
+  prompt: string;
+  model: string;
+  agent: "codex" | "claude_code";
+  api_key_secret: string;
+  hardness?: "easy" | "medium" | "hard";
+  loop?: { goal?: string; max_iterations?: number };
+  github?: { token_secret?: string; base_branch?: string; draft?: boolean };
+  task?: AgentTask;
+  mode?: "change" | "review";
+  constraints?: AgentConstraints;
+  context?: AgentContext;
+  verify?: AgentVerifyCommand[];
+}
+
+export interface AgentTask {
+  name?: string;
+  external_id?: string;
+  parent_run_id?: string;
+  labels?: string[];
+  priority?: number;
+}
+
+export interface AgentConstraints {
+  allowed_paths?: string[];
+  blocked_paths?: string[];
+  max_changed_files?: number;
+  max_diff_bytes?: number;
+  max_runtime_seconds?: number;
+  max_artifact_bytes?: number;
+}
+
+export interface AgentContext {
+  instructions?: string;
+  files?: { path: string; content: string }[];
+  links?: { title?: string; url: string; description?: string }[];
+}
+
+export interface AgentVerifyCommand {
+  name: string;
+  run: string;
+  timeout_seconds?: number;
+  fail_run?: boolean;
+}
+
+export interface AgentRunReport {
+  run_id: string;
+  outcome: string;
+  summary: string;
+  task: AgentTask;
+  mode: string;
+  agent: string;
+  model: string;
+  template?: string | null;
+  hardness: string;
+  sandbox_id?: string | null;
+  branch?: string | null;
+  commit?: string | null;
+  pr_url?: string | null;
+  diff_stats: { files_changed: number; additions: number; deletions: number; bytes: number };
+  changed_files: { path: string; status: string; additions: number; deletions: number }[];
+  constraints: { passed: boolean; violations: string[] };
+  verification: {
+    name: string;
+    command: string;
+    exit_code: number;
+    passed: boolean;
+    fail_run: boolean;
+    duration_ms: number;
+    stdout_tail: string;
+    stderr_tail: string;
+  }[];
+  artifacts: { path: string; bytes: number; content?: string | null; truncated: boolean }[];
+  error?: string | null;
+  stdout_tail: string;
+  stderr_tail: string;
+  logs_truncated: boolean;
+  duration_ms?: number | null;
+  generated_at: string;
+}
+
+export interface AgentRunCompactReport {
+  outcome?: string;
+  summary?: string;
+  changed_files?: number;
+  artifacts?: number;
+  verification?: AgentRunReport["verification"];
+}
+
+export interface AgentRun {
+  id: string;
+  state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | string;
+  sandbox_id?: string | null;
+  template?: string | null;
+  repo?: { url: string; ref?: string };
+  prompt?: string;
+  model?: string;
+  agent?: string;
+  api_key_secret?: string;
+  hardness?: string;
+  loop?: Record<string, unknown>;
+  github?: Record<string, unknown> | null;
+  task?: AgentTask;
+  mode?: string;
+  constraints?: AgentConstraints;
+  context?: AgentContext;
+  verify?: AgentVerifyCommand[];
+  verification_result?: string | null;
+  verification_results?: AgentRunReport["verification"];
+  artifacts?: AgentRunReport["artifacts"];
+  constraint_result?: AgentRunReport["constraints"] | null;
+  report?: AgentRunReport | AgentRunCompactReport | null;
+  branch?: string | null;
+  commit?: string | null;
+  pr_url?: string | null;
+  error?: string | null;
+  logs_truncated?: boolean;
+  created_at: string;
+  updated_at: string;
+  finished_at?: string | null;
+  status_url?: string;
+  logs_url?: string;
+  report_url?: string;
+  children_url?: string;
+}
+
+export interface AgentRunLogs {
+  id: string;
+  state: string;
+  stdout: string;
+  stderr: string;
+  diff: string;
+  truncated: boolean;
+}
+
+export interface AgentRunListFilters {
+  parent_run_id?: string;
+  label?: string;
+  state?: string;
+}
+
 export class SandboxError extends Error {
   constructor(public status: number, public code: string, message: string) {
     super(`[${status} ${code}] ${message}`);
@@ -145,13 +317,23 @@ export class Sandbox {
     return this;
   }
 
-  async exec(cmd: string, opts: { cwd?: string; env?: Record<string, string>; background?: boolean } = {}): Promise<ExecResult> {
+  async exec(cmd: string, opts?: { cwd?: string; env?: Record<string, string>; background?: false }): Promise<ExecResult>;
+  async exec(cmd: string, opts: { cwd?: string; env?: Record<string, string>; background: true }): Promise<ExecJob>;
+  async exec(cmd: string, opts: { cwd?: string; env?: Record<string, string>; background?: boolean } = {}): Promise<ExecResult | ExecJob> {
     return this.http.request("POST", `/v1/sandboxes/${this.id}/exec`, {
       cmd,
       cwd: opts.cwd,
       env: opts.env,
       background: opts.background ?? false,
     });
+  }
+
+  async execStatus(cmdId: string): Promise<ExecJob> {
+    return this.http.request("GET", `/v1/sandboxes/${this.id}/exec/${cmdId}`);
+  }
+
+  async execLogs(cmdId: string): Promise<ExecLogs> {
+    return this.http.request("GET", `/v1/sandboxes/${this.id}/exec/${cmdId}/logs`);
   }
 
   async writeFile(path: string, content: string): Promise<void> {
@@ -243,6 +425,80 @@ class Images {
   delete(id: string) { return this.http.request("DELETE", `/v1/images/${id}`); }
 }
 
+class Templates {
+  constructor(private http: Http) {}
+  create(input: { name: string; description?: string; create?: Record<string, unknown> }) {
+    return this.http.request<SandboxTemplate>("POST", "/v1/templates", {
+      name: input.name,
+      description: input.description,
+      create: input.create ?? {},
+    });
+  }
+  get(name: string) { return this.http.request<SandboxTemplate>("GET", `/v1/templates/${encodeURIComponent(name)}`); }
+  list() {
+    return this.http.request<{ templates: SandboxTemplate[] }>("GET", "/v1/templates")
+      .then((r) => r.templates);
+  }
+  update(name: string, input: { description?: string; create?: Record<string, unknown> }) {
+    return this.http.request<SandboxTemplate>("PUT", `/v1/templates/${encodeURIComponent(name)}`, {
+      description: input.description,
+      create: input.create ?? {},
+    });
+  }
+  delete(name: string) {
+    return this.http.request("DELETE", `/v1/templates/${encodeURIComponent(name)}`);
+  }
+  spawn(name: string, opts: { count?: number; overrides?: Record<string, unknown> } = {}) {
+    return this.http.request<{ sandboxes: any[] }>(
+      "POST",
+      `/v1/templates/${encodeURIComponent(name)}/sandboxes`,
+      opts,
+    ).then((r) => r.sandboxes.map((s) => new Sandbox(this.http, s)));
+  }
+}
+
+class AgentRuns {
+  constructor(private http: Http) {}
+  create(req: AgentRunRequest) {
+    return this.http.request<AgentRun>("POST", "/v1/agent-runs", req);
+  }
+  get(id: string) {
+    return this.http.request<AgentRun>("GET", `/v1/agent-runs/${id}`);
+  }
+  list(filters: AgentRunListFilters = {}) {
+    const qs = new URLSearchParams();
+    if (filters.parent_run_id) qs.set("parent_run_id", filters.parent_run_id);
+    if (filters.label) qs.set("label", filters.label);
+    if (filters.state) qs.set("state", filters.state);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return this.http.request<{ agent_runs: AgentRun[] }>("GET", `/v1/agent-runs${suffix}`)
+      .then((r) => r.agent_runs);
+  }
+  logs(id: string) {
+    return this.http.request<AgentRunLogs>("GET", `/v1/agent-runs/${id}/logs`);
+  }
+  report(id: string) {
+    return this.http.request<AgentRunReport>("GET", `/v1/agent-runs/${id}/report`);
+  }
+  children(id: string) {
+    return this.http.request<{ agent_runs: AgentRun[] }>("GET", `/v1/agent-runs/${id}/children`)
+      .then((r) => r.agent_runs);
+  }
+  cancel(id: string) {
+    return this.http.request<AgentRun>("POST", `/v1/agent-runs/${id}/cancel`);
+  }
+  async wait(id: string, opts: { intervalMs?: number; timeoutMs?: number } = {}) {
+    const intervalMs = opts.intervalMs ?? 2000;
+    const deadline = Date.now() + (opts.timeoutMs ?? 30 * 60 * 1000);
+    while (true) {
+      const run = await this.get(id);
+      if (run.state !== "queued" && run.state !== "running") return run;
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for agent run ${id}`);
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+}
+
 class Volumes {
   constructor(private http: Http) {}
   create(name: string, sizeGb: number) {
@@ -271,6 +527,8 @@ class Secrets {
 export class Client {
   readonly sandboxes: Sandboxes;
   readonly images: Images;
+  readonly templates: Templates;
+  readonly agentRuns: AgentRuns;
   readonly volumes: Volumes;
   readonly nodes: Nodes;
   readonly secrets: Secrets;
@@ -280,6 +538,8 @@ export class Client {
     this.http = new Http(baseUrl, apiKey);
     this.sandboxes = new Sandboxes(this.http);
     this.images = new Images(this.http);
+    this.templates = new Templates(this.http);
+    this.agentRuns = new AgentRuns(this.http);
     this.volumes = new Volumes(this.http);
     this.nodes = new Nodes(this.http);
     this.secrets = new Secrets(this.http);

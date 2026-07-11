@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "guest-agent"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "libc",
  "serde",
@@ -1437,7 +1437,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sandboxd"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

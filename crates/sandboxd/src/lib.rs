@@ -4,6 +4,7 @@
 //! control plane API + scheduler + host agent + runtime, plus the multi-node
 //! primitives (node registry, join token, drain) from §6.3.
 
+pub mod agent;
 pub mod api;
 pub mod app;
 pub mod auth;
@@ -33,6 +34,7 @@ pub mod secrets;
 pub mod service;
 pub mod state;
 pub mod store;
+pub mod templates;
 pub mod usage;
 pub mod views;
 

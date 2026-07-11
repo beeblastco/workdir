@@ -1,9 +1,10 @@
 # Extended Features
 
 Capabilities added on top of the base spec: secret management, docker-in-docker,
-S3 bucket mounts, ephemeral files/images, coding agent, persistent volumes, and
-create-time network egress controls. All are opt-in and preserve the cheap
-default path (a no-option `create()` is unchanged).
+S3 bucket mounts, ephemeral files/images, coding agent, sandbox templates,
+agent PR runs, persistent volumes, and create-time network egress controls. All
+are opt-in and preserve the cheap default path (a no-option `create()` is
+unchanged).
 
 ---
 
@@ -197,7 +198,68 @@ with a `400`. Works on any curated image (all ship `curl` + default egress).
 
 ---
 
-## 6. Persistent volumes
+## 6. Sandbox templates and agent PR runs
+
+Templates are named, org-scoped sandbox create configs. Store the repo, image,
+resources, startup commands, ports, network policy, and secret names once, then
+spawn one or many fresh sandboxes by template name:
+
+```jsonc
+POST /v1/templates
+{
+  "name": "node-app",
+  "create": {
+    "image": "node-python",
+    "resources": { "cpu": 2, "memory_mb": 4096, "disk_gb": 16 },
+    "startup": {
+      "git": { "url": "https://github.com/acme/app.git", "ref": "main" },
+      "commands": [{ "name": "install", "run": "pnpm install --frozen-lockfile" }]
+    }
+  }
+}
+
+POST /v1/templates/node-app/sandboxes
+{ "count": 3, "overrides": { "auto_stop_seconds": 600 } }
+```
+
+Agent runs build on templates. Workdir creates a sandbox, passes the model
+provider key only to the agent process, runs Codex or Claude Code, collects the
+staged git diff, creates a backend report for a main agent, and can open a
+GitHub PR from the control plane:
+
+```jsonc
+POST /v1/agent-runs
+{
+  "template": "node-app",
+  "repo": { "url": "https://github.com/acme/app.git", "ref": "main" },
+  "agent": "codex",
+  "model": "gpt-5",
+  "api_key_secret": "OPENAI_API_KEY",
+  "prompt": "Fix the failing tests.",
+  "hardness": "medium",
+  "task": { "name": "Fix tests", "labels": ["delegated"] },
+  "constraints": { "max_changed_files": 6 },
+  "verify": [{ "name": "tests", "run": "npm test", "fail_run": true }],
+  "github": { "token_secret": "GITHUB_TOKEN", "draft": true }
+}
+```
+
+`api_key_secret` is a Workdir secret name. For the agent process, Workdir maps
+that secret's value to the provider-specific CLI environment variable
+(`CODEX_API_KEY` for Codex, `ANTHROPIC_API_KEY` for Claude Code).
+
+`hardness` chooses default resources and timeout when no template is provided
+(`easy`, `medium`, `hard`). Template values and explicit request fields win over
+the profile defaults. GitHub write tokens are not injected into the sandbox; the
+control plane uses them to create the branch, commit, push, and PR.
+Prompt the sandbox agent to edit files and leave a diff. Workdir handles the
+GitHub branch, commit, push, and PR after the agent exits.
+Use `GET /v1/agent-runs/:id/report` for the deterministic handoff report, and
+`mode: "review"` for inspection-only subtasks that should not require a diff.
+
+---
+
+## 7. Persistent volumes
 
 Attach org-scoped block storage that survives sandbox deletion, so workspace
 state can move from one sandbox session to the next.
@@ -228,7 +290,7 @@ is configured before VM start, and fork is refused while volumes are attached.
 
 ---
 
-## 7. Network egress controls
+## 8. Network egress controls
 
 Attach a create-time egress policy to a sandbox under `startup.network`.
 Omitting it keeps the backward-compatible default internet egress.
