@@ -231,6 +231,7 @@ pub async fn build_state(cfg: Config) -> Result<crate::state::AppState> {
         http,
         secret_key,
         admission: tokio::sync::Mutex::new(()),
+        terminal_tokens: Default::default(),
     });
     Ok(state)
 }

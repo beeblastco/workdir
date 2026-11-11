@@ -3,19 +3,20 @@
 //! Keys are presented as `Authorization: Bearer sk_live_...`. We store only the
 //! SHA-256 hash; the plaintext is shown once at creation.
 //!
-//! The PTY route also takes a terminal token, `tt1.<expires_at_ms>.<signature>`:
-//! base64url HMAC-SHA256 over `terminal\0<sandbox_id>\0<expires_at_ms>`, keyed
-//! with the stored key hash (hex text) of a key in the sandbox's org. It opens
-//! that one sandbox's terminal until it expires, and nothing else.
+//! The PTY route also takes a one-time terminal token minted by
+//! `POST /v1/sandboxes/:id/pty-token` (see [`TerminalTokens`]).
 
 use crate::store::Store;
 use crate::usage::{ApiKey, Org, OrgStatus};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use hmac::{Hmac, Mac};
+use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-const TERMINAL_TOKEN_PREFIX: &str = "tt1";
+/// Fixed by the host; the caller cannot ask for longer.
+pub const TERMINAL_TOKEN_TTL_SECS: i64 = 120;
+/// Open (unused, unexpired) terminal tokens one org may hold at once.
+pub const TERMINAL_TOKENS_PER_ORG: usize = 64;
 
 pub fn hash_key(plaintext: &str) -> String {
     let mut h = Sha256::new();
@@ -53,47 +54,6 @@ pub fn authenticate(store: &Store, bearer: Option<&str>) -> AuthOutcome {
     if key.disabled {
         return AuthOutcome::Invalid;
     }
-    org_outcome(store, key)
-}
-
-/// Verify a terminal token for `sandbox_id` (PTY route only). An unknown
-/// sandbox and a bad signature both return `Invalid`, so ids cannot be probed.
-pub fn authenticate_terminal(
-    store: &Store,
-    token: &str,
-    sandbox_id: &str,
-    now_ms: i64,
-) -> AuthOutcome {
-    let Some((expires_at, signature)) = parse_terminal_token(token) else {
-        return AuthOutcome::Invalid;
-    };
-    if expires_at <= now_ms {
-        return AuthOutcome::Invalid;
-    }
-    let org_id = match store.get_sandbox(sandbox_id) {
-        Ok(Some(sb)) => sb.org_id,
-        _ => return AuthOutcome::Invalid,
-    };
-    let keys = store.list_api_keys_for_org(&org_id).unwrap_or_default();
-    let Some(key) = keys.into_iter().find(|k| {
-        !k.disabled
-            && terminal_mac(&k.key_hash, sandbox_id, expires_at)
-                .verify_slice(&signature)
-                .is_ok()
-    }) else {
-        return AuthOutcome::Invalid;
-    };
-    match org_outcome(store, key) {
-        // The token never carries admin scope, even when signed with an admin key.
-        AuthOutcome::Ok(ctx) => AuthOutcome::Ok(AuthContext {
-            org_id: ctx.org_id,
-            admin: false,
-        }),
-        other => other,
-    }
-}
-
-fn org_outcome(store: &Store, key: ApiKey) -> AuthOutcome {
     match store.get_org(&key.org_id) {
         // Admin keys are never locked out by suspension — otherwise suspending
         // an org (or the admin's own org) would lock the operator out of the
@@ -107,24 +67,77 @@ fn org_outcome(store: &Store, key: ApiKey) -> AuthOutcome {
     }
 }
 
-fn parse_terminal_token(token: &str) -> Option<(i64, Vec<u8>)> {
-    let mut parts = token.split('.');
-    let (Some(TERMINAL_TOKEN_PREFIX), Some(expiry), Some(signature), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    let expires_at = expiry.parse::<i64>().ok()?;
-    let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
-    Some((expires_at, signature))
+/// One-time terminal tokens, held only in memory so neither the DB nor its
+/// backups can open a terminal. Keyed by the token's SHA-256, like API keys, so
+/// lookup timing says nothing about the token. A restart forgets open tokens.
+#[derive(Default)]
+pub struct TerminalTokens {
+    open: Mutex<HashMap<String, TerminalGrant>>,
 }
 
-/// `verify_slice` on the result compares in constant time.
-fn terminal_mac(key_hash: &str, sandbox_id: &str, expires_at: i64) -> Hmac<Sha256> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key_hash.as_bytes())
-        .expect("HMAC accepts keys of any length");
-    mac.update(format!("terminal\0{sandbox_id}\0{expires_at}").as_bytes());
-    mac
+struct TerminalGrant {
+    sandbox_id: String,
+    org_id: String,
+    expires_at: DateTime<Utc>,
+}
+
+impl TerminalTokens {
+    /// Verify and consume `token` for the PTY of `sandbox_id`. Any presentation
+    /// uses the token up. Every failure but suspension is `Invalid`.
+    pub fn authenticate(
+        &self,
+        store: &Store,
+        token: &str,
+        sandbox_id: &str,
+        now: DateTime<Utc>,
+    ) -> AuthOutcome {
+        let Some(org_id) = self.redeem(token, sandbox_id, now) else {
+            return AuthOutcome::Invalid;
+        };
+        match store.get_sandbox(sandbox_id) {
+            Ok(Some(sb)) if sb.org_id == org_id => {}
+            _ => return AuthOutcome::Invalid,
+        }
+        match store.get_org(&org_id) {
+            Ok(Some(org)) if org.status == OrgStatus::Suspended => AuthOutcome::Suspended,
+            Ok(Some(_)) => AuthOutcome::Ok(AuthContext {
+                org_id,
+                admin: false,
+            }),
+            _ => AuthOutcome::Invalid,
+        }
+    }
+
+    /// Mint a token for `sandbox_id` owned by `org_id`. `None` when the org
+    /// already holds [`TERMINAL_TOKENS_PER_ORG`] open tokens.
+    pub fn mint(
+        &self,
+        sandbox_id: &str,
+        org_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<(String, DateTime<Utc>)> {
+        let mut open = self.open.lock().unwrap();
+        open.retain(|_, grant| grant.expires_at > now);
+        if open.values().filter(|grant| grant.org_id == org_id).count() >= TERMINAL_TOKENS_PER_ORG {
+            return None;
+        }
+        let token = crate::ids::terminal_token();
+        let expires_at = now + Duration::seconds(TERMINAL_TOKEN_TTL_SECS);
+        open.insert(
+            hash_key(&token),
+            TerminalGrant {
+                sandbox_id: sandbox_id.to_string(),
+                org_id: org_id.to_string(),
+                expires_at,
+            },
+        );
+        Some((token, expires_at))
+    }
+
+    fn redeem(&self, token: &str, sandbox_id: &str, now: DateTime<Utc>) -> Option<String> {
+        let grant = self.open.lock().unwrap().remove(&hash_key(token))?;
+        (grant.sandbox_id == sandbox_id && grant.expires_at > now).then_some(grant.org_id)
+    }
 }
 
 /// Seed the bootstrap org + admin key on first boot. Returns the plaintext key
@@ -195,30 +208,54 @@ mod tests {
         assert!(matches!(authenticate(&store, None), AuthOutcome::Missing));
     }
 
-    /// Pinned to the same vector as Broods core's signer, so both sides agree on the bytes.
     #[test]
-    fn terminal_token_matches_shared_vector() {
-        let token = "tt1.4102444800000.6Skbp31ryI8i4j9JJotL4ED4JAHrgNEGKNMm8uiopXc";
-        let (expires_at, signature) = parse_terminal_token(token).unwrap();
-        assert_eq!(expires_at, 4_102_444_800_000);
-        let mac = terminal_mac(&hash_key("tenant-key"), "sbx_handler", expires_at);
-        assert!(mac.verify_slice(&signature).is_ok());
-        let other = terminal_mac(&hash_key("tenant-key"), "sbx_other", expires_at);
-        assert!(other.verify_slice(&signature).is_err());
+    fn terminal_token_is_single_use_and_bound_to_its_sandbox() {
+        let tokens = TerminalTokens::default();
+        let now = Utc::now();
+        let (token, expires_at) = tokens.mint("sbx_a", "org_a", now).unwrap();
+        assert_eq!(expires_at - now, Duration::seconds(TERMINAL_TOKEN_TTL_SECS));
+        assert_eq!(token.len(), "wtt_".len() + 64);
+        assert_eq!(
+            tokens.redeem(&token, "sbx_a", now).as_deref(),
+            Some("org_a")
+        );
+        assert_eq!(tokens.redeem(&token, "sbx_a", now), None);
+
+        let (token, _) = tokens.mint("sbx_a", "org_a", now).unwrap();
+        assert_eq!(tokens.redeem(&token, "sbx_b", now), None);
+        assert_eq!(
+            tokens.redeem(&token, "sbx_a", now),
+            None,
+            "a wrong-sandbox try uses it up"
+        );
+        assert_eq!(tokens.redeem("wtt_unknown", "sbx_a", now), None);
     }
 
     #[test]
-    fn terminal_token_parse_rejects_malformed() {
-        for token in [
-            "",
-            "tt1",
-            "tt1.123",
-            "tt2.123.AAAA",
-            "tt1.soon.AAAA",
-            "tt1.123.not base64!",
-            "tt1.123.AAAA.extra",
-        ] {
-            assert!(parse_terminal_token(token).is_none(), "{token}");
+    fn terminal_token_expires_after_the_fixed_lifetime() {
+        let tokens = TerminalTokens::default();
+        let now = Utc::now();
+        let (token, expires_at) = tokens.mint("sbx_a", "org_a", now).unwrap();
+        assert_eq!(tokens.redeem(&token, "sbx_a", expires_at), None);
+    }
+
+    #[test]
+    fn terminal_tokens_are_capped_per_org_until_they_expire() {
+        let tokens = TerminalTokens::default();
+        let now = Utc::now();
+        for _ in 0..TERMINAL_TOKENS_PER_ORG {
+            tokens.mint("sbx_a", "org_a", now).unwrap();
         }
+        assert!(tokens.mint("sbx_a", "org_a", now).is_none());
+        assert!(
+            tokens.mint("sbx_b", "org_b", now).is_some(),
+            "the cap is per org"
+        );
+        let later = now + Duration::seconds(TERMINAL_TOKEN_TTL_SECS);
+        assert!(
+            tokens.mint("sbx_a", "org_a", later).is_some(),
+            "expired tokens are dropped"
+        );
+        assert_eq!(tokens.open.lock().unwrap().len(), 1);
     }
 }

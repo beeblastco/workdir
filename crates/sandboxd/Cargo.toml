@@ -40,8 +40,6 @@ clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 sha2 = "0.10"
-hmac = "0.12"
-base64 = "0.22"
 hex = "0.4"
 async-trait = "0.1"
 aes-gcm = "0.10"

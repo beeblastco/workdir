@@ -15,7 +15,7 @@ pub mod templates;
 pub mod usage;
 pub mod volumes;
 
-use crate::auth::{authenticate, authenticate_terminal, AuthContext, AuthOutcome};
+use crate::auth::{authenticate, AuthContext, AuthOutcome};
 use crate::error::ApiError;
 use crate::model::Sandbox;
 use crate::state::AppState;
@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
             get(sandboxes::exec_logs),
         )
         .route("/sandboxes/:id/metrics", get(sandboxes::metrics))
+        .route("/sandboxes/:id/pty-token", post(pty::mint_token))
         .route(
             "/sandboxes/:id/files",
             get(sandboxes::read_file).put(sandboxes::write_file),
@@ -158,7 +159,7 @@ async fn auth_mw(State(state): State<AppState>, req: Request, next: Next) -> Res
 }
 
 /// Auth for `GET /v1/sandboxes/:id/pty`: an API key as on every route, or a
-/// terminal token for this one sandbox (see [`authenticate_terminal`]).
+/// one-time terminal token for this one sandbox (see [`crate::auth::TerminalTokens`]).
 async fn pty_auth_mw(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -167,11 +168,11 @@ async fn pty_auth_mw(
 ) -> Response {
     let bearer = bearer(&req);
     let outcome = match authenticate(&state.store, bearer.as_deref()) {
-        AuthOutcome::Invalid => authenticate_terminal(
+        AuthOutcome::Invalid => state.terminal_tokens.authenticate(
             &state.store,
             bearer.as_deref().unwrap_or_default(),
             &id,
-            chrono::Utc::now().timestamp_millis(),
+            chrono::Utc::now(),
         ),
         other => other,
     };

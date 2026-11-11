@@ -1830,17 +1830,14 @@ async fn empty_pool_create_restores_from_golden_snapshot() {
     );
 }
 
-/// Mints a terminal token the way Broods core does: HMAC-SHA256 keyed with the
-/// SHA-256 hex of an API key, over `terminal\0<sandbox_id>\0<expires_at_ms>`.
-fn terminal_token(api_key: &str, sandbox_id: &str, expires_at: i64) -> String {
-    use base64::Engine;
-    use hmac::Mac;
-    let key_hash = sandboxd::auth::hash_key(api_key);
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key_hash.as_bytes()).unwrap();
-    mac.update(format!("terminal\0{sandbox_id}\0{expires_at}").as_bytes());
-    let signature =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    format!("tt1.{expires_at}.{signature}")
+/// Mints a one-time terminal token for `id` with `auth`, returning the response.
+async fn mint_pty_token(base: &str, id: &str, auth: &str) -> reqwest::Response {
+    client()
+        .post(format!("{base}/v1/sandboxes/{id}/pty-token"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
 }
 
 async fn open_pty(
@@ -1875,7 +1872,7 @@ async fn open_pty(
 }
 
 #[tokio::test]
-async fn pty_accepts_a_terminal_token_for_its_sandbox_only() {
+async fn pty_accepts_a_minted_terminal_token_once_for_its_sandbox_only() {
     let (base, key, _tmp) = spawn_server().await;
     let c = client();
     let auth = format!("Bearer {key}");
@@ -1893,7 +1890,9 @@ async fn pty_accepts_a_terminal_token_for_its_sandbox_only() {
     let (id, sibling) = (&ids[0], &ids[1]);
     c.post(format!("{base}/v1/admin/orgs"))
         .header("authorization", &auth)
-        .json(&serde_json::json!({"id": "org_other", "name": "other"}))
+        .json(
+            &serde_json::json!({"id": "org_other", "name": "other", "prepaid_credits_usd": 100.0}),
+        )
         .send()
         .await
         .unwrap();
@@ -1909,11 +1908,21 @@ async fn pty_accepts_a_terminal_token_for_its_sandbox_only() {
         .unwrap();
     assert_eq!(resp.status(), 201);
 
-    let later = chrono::Utc::now().timestamp_millis() + 120_000;
-    let token = terminal_token(&key, id, later);
+    let mint = |auth: String| {
+        let base = base.clone();
+        let id = id.clone();
+        async move {
+            let resp = mint_pty_token(&base, &id, &auth).await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["expires_at"].is_string());
+            body["token"].as_str().unwrap().to_string()
+        }
+    };
+    let token = mint(auth.clone()).await;
     open_pty(&base, id, &token)
         .await
-        .expect("a valid terminal token opens the PTY");
+        .expect("a minted terminal token opens the PTY");
     open_pty(&base, id, &key)
         .await
         .expect("an API key still opens the PTY");
@@ -1931,42 +1940,68 @@ async fn pty_accepts_a_terminal_token_for_its_sandbox_only() {
         }
     };
     let pty = |sandbox: &str| format!("{base}/v1/sandboxes/{sandbox}/pty");
-    let bad_signature = refused(pty(id), format!("{token}x")).await;
-    assert_eq!(bad_signature.0, 401);
+    let used = refused(pty(id), token.clone()).await;
+    assert_eq!(used.0, 401, "a token opens the PTY once");
     let cases = [
-        (
-            "expired",
-            pty(id),
-            terminal_token(&key, id, chrono::Utc::now().timestamp_millis() - 1),
-        ),
-        ("other sandbox", pty(sibling), token.clone()),
-        (
-            "other org's key",
-            pty(id),
-            terminal_token("sk_live_other", id, later),
-        ),
-        ("malformed", pty(id), "tt1.later.sig".to_string()),
+        ("other sandbox", pty(sibling), mint(auth.clone()).await),
+        ("unknown", pty(id), format!("wtt_{}", "0".repeat(64))),
+        ("malformed", pty(id), "not-a-token".to_string()),
         (
             "unknown sandbox",
             pty("sbx_missing"),
-            terminal_token(&key, "sbx_missing", later),
+            mint(auth.clone()).await,
         ),
         (
             "other route",
             format!("{base}/v1/sandboxes/{id}"),
-            token.clone(),
+            mint(auth.clone()).await,
         ),
         (
             "other route",
-            format!("{base}/v1/sandboxes/{id}/metrics"),
-            token.clone(),
+            format!("{base}/v1/sandboxes/{id}/pty-token"),
+            mint(auth.clone()).await,
         ),
     ];
     for (name, path, bearer) in cases {
         assert_eq!(
             refused(path, bearer).await,
-            bad_signature,
-            "{name} must be refused exactly like a bad signature"
+            used,
+            "{name} must be refused exactly like a used token"
         );
     }
+
+    let other_org = mint_pty_token(&base, id, "Bearer sk_live_other").await;
+    assert_eq!(
+        other_org.status(),
+        404,
+        "another org cannot mint for a sandbox it does not own"
+    );
+
+    let other_auth = "Bearer sk_live_other";
+    let resp = c
+        .post(format!("{base}/v1/sandboxes"))
+        .header("authorization", other_auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let other_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = mint_pty_token(&base, &other_id, other_auth).await;
+    let token = resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.post(format!("{base}/v1/admin/orgs/org_other/suspend"))
+        .header("authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(pty(&other_id), token).await.0,
+        403,
+        "a suspended org's token is refused"
+    );
 }
