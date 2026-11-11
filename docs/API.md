@@ -16,7 +16,7 @@ The default create is one call with no body and yields the cheapest, fastest pat
 | `POST` | `/v1/sandboxes/:id/exec` | `{cmd, cwd?, env?, background?}` → sync `{exit_code, stdout, stderr}` or, with `background: true`, `202 {cmd_id, state, status_url, logs_url}`. |
 | `GET` | `/v1/sandboxes/:id/exec/:cmd_id` | Poll background exec status → `{state, exit_code?, started_at, finished_at?, error?}`. |
 | `GET` | `/v1/sandboxes/:id/exec/:cmd_id/logs` | Fetch captured background exec output → `{stdout, stderr, truncated}`. |
-| `GET` | `/v1/sandboxes/:id/pty` | WebSocket interactive shell (a real in-guest TTY over vsock on Firecracker). |
+| `GET` | `/v1/sandboxes/:id/pty` | WebSocket interactive shell (a real in-guest TTY over vsock on Firecracker). Also takes a [terminal token](#terminal-tokens). |
 | `GET` | `/v1/sandboxes/:id/metrics` | Working-set metrics: host RSS vs reserved shape, balloon target + guest memory stats, net counters. |
 | `GET` | `/v1/sandboxes/:id/files?path=…` | Read a file → `{content, encoding}`. |
 | `PUT` | `/v1/sandboxes/:id/files` | `{path, content, encoding?}` → write. |
@@ -28,6 +28,20 @@ The default create is one call with no body and yields the cheapest, fastest pat
 | `POST` | `/v1/sandboxes/:id/pause` | Stop (release CPU/mem; keep billing correct). |
 | `POST` | `/v1/sandboxes/:id/resume` | Resume from stopped disk/snapshot. |
 | `DELETE` | `/v1/sandboxes/:id` | Stop, delete ephemeral disk, remove routes. |
+
+### Terminal tokens
+
+`GET /v1/sandboxes/:id/pty` also accepts `Authorization: Bearer tt1.<expires_at_ms>.<signature>`,
+so a relay can open one sandbox's terminal without holding the org's API key.
+
+- `signature` is base64url (no padding) of HMAC-SHA256 over `terminal\0<sandbox_id>\0<expires_at_ms>`.
+- The HMAC key is the SHA-256 hex (lowercase, as text) of an enabled API key of the sandbox's org:
+  the same value the server stores, so the server needs no extra secret.
+- The token is refused once `expires_at_ms` (Unix milliseconds) has passed, for any other sandbox,
+  and on every other route. It never carries admin scope.
+- An unknown sandbox and a bad signature get the same `401 unauthorized`.
+- A leaked key hash mints terminal tokens for that org's sandboxes; it still does not authenticate
+  as an API key. Revoke the key to stop both.
 
 ## Templates
 

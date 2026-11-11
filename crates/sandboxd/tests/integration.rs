@@ -1829,3 +1829,144 @@ async fn empty_pool_create_restores_from_golden_snapshot() {
         "an empty-pool create with a golden snapshot must restore, not cold boot: {paths:?}"
     );
 }
+
+/// Mints a terminal token the way Broods core does: HMAC-SHA256 keyed with the
+/// SHA-256 hex of an API key, over `terminal\0<sandbox_id>\0<expires_at_ms>`.
+fn terminal_token(api_key: &str, sandbox_id: &str, expires_at: i64) -> String {
+    use base64::Engine;
+    use hmac::Mac;
+    let key_hash = sandboxd::auth::hash_key(api_key);
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key_hash.as_bytes()).unwrap();
+    mac.update(format!("terminal\0{sandbox_id}\0{expires_at}").as_bytes());
+    let signature =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    format!("tt1.{expires_at}.{signature}")
+}
+
+async fn open_pty(
+    base: &str,
+    id: &str,
+    bearer: &str,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut request = format!("{}/v1/sandboxes/{id}/pty", base.replacen("http", "ws", 1))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
+    socket
+        .send(Message::Text("echo pty-$((40 + 2))\n".into()))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("pty-42") {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("pty output")
+            .expect("pty open")
+            .unwrap();
+        seen.extend(msg.into_data());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pty_accepts_a_terminal_token_for_its_sandbox_only() {
+    let (base, key, _tmp) = spawn_server().await;
+    let c = client();
+    let auth = format!("Bearer {key}");
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let resp = c
+            .post(format!("{base}/v1/sandboxes"))
+            .header("authorization", &auth)
+            .send()
+            .await
+            .unwrap();
+        let sb: serde_json::Value = resp.json().await.unwrap();
+        ids.push(sb["id"].as_str().unwrap().to_string());
+    }
+    let (id, sibling) = (&ids[0], &ids[1]);
+    c.post(format!("{base}/v1/admin/orgs"))
+        .header("authorization", &auth)
+        .json(&serde_json::json!({"id": "org_other", "name": "other"}))
+        .send()
+        .await
+        .unwrap();
+    let resp = c
+        .post(format!("{base}/v1/admin/keys"))
+        .header("authorization", &auth)
+        .json(&serde_json::json!({
+            "org_id": "org_other",
+            "key_hash": sandboxd::auth::hash_key("sk_live_other"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let later = chrono::Utc::now().timestamp_millis() + 120_000;
+    let token = terminal_token(&key, id, later);
+    open_pty(&base, id, &token)
+        .await
+        .expect("a valid terminal token opens the PTY");
+    open_pty(&base, id, &key)
+        .await
+        .expect("an API key still opens the PTY");
+
+    let refused = |path: String, bearer: String| {
+        let c = c.clone();
+        async move {
+            let resp = c
+                .get(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .send()
+                .await
+                .unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let pty = |sandbox: &str| format!("{base}/v1/sandboxes/{sandbox}/pty");
+    let bad_signature = refused(pty(id), format!("{token}x")).await;
+    assert_eq!(bad_signature.0, 401);
+    let cases = [
+        (
+            "expired",
+            pty(id),
+            terminal_token(&key, id, chrono::Utc::now().timestamp_millis() - 1),
+        ),
+        ("other sandbox", pty(sibling), token.clone()),
+        (
+            "other org's key",
+            pty(id),
+            terminal_token("sk_live_other", id, later),
+        ),
+        ("malformed", pty(id), "tt1.later.sig".to_string()),
+        (
+            "unknown sandbox",
+            pty("sbx_missing"),
+            terminal_token(&key, "sbx_missing", later),
+        ),
+        (
+            "other route",
+            format!("{base}/v1/sandboxes/{id}"),
+            token.clone(),
+        ),
+        (
+            "other route",
+            format!("{base}/v1/sandboxes/{id}/metrics"),
+            token.clone(),
+        ),
+    ];
+    for (name, path, bearer) in cases {
+        assert_eq!(
+            refused(path, bearer).await,
+            bad_signature,
+            "{name} must be refused exactly like a bad signature"
+        );
+    }
+}

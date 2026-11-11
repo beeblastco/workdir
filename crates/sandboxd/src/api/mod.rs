@@ -15,11 +15,11 @@ pub mod templates;
 pub mod usage;
 pub mod volumes;
 
-use crate::auth::{authenticate, AuthContext, AuthOutcome};
+use crate::auth::{authenticate, authenticate_terminal, AuthContext, AuthOutcome};
 use crate::error::ApiError;
 use crate::model::Sandbox;
 use crate::state::AppState;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -41,7 +41,6 @@ pub fn router(state: AppState) -> Router {
             get(sandboxes::exec_logs),
         )
         .route("/sandboxes/:id/metrics", get(sandboxes::metrics))
-        .route("/sandboxes/:id/pty", get(pty::pty_ws))
         .route(
             "/sandboxes/:id/files",
             get(sandboxes::read_file).put(sandboxes::write_file),
@@ -121,7 +120,12 @@ pub fn router(state: AppState) -> Router {
         .route("/agent-runs/:id/children", get(agent_runs::children))
         .route("/agent-runs/:id/cancel", post(agent_runs::cancel))
         .route("/agent-runs/:id/logs", get(agent_runs::logs))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_mw));
+        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        .merge(
+            Router::new()
+                .route("/sandboxes/:id/pty", get(pty::pty_ws))
+                .route_layer(middleware::from_fn_with_state(state.clone(), pty_auth_mw)),
+        );
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -148,14 +152,42 @@ async fn healthz() -> impl IntoResponse {
 
 /// API-key auth middleware (spec §6.1, §18). On success, inserts an
 /// [`AuthContext`] into request extensions for handlers to read.
-async fn auth_mw(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let bearer = req
-        .headers()
+async fn auth_mw(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let outcome = authenticate(&state.store, bearer(&req).as_deref());
+    respond(outcome, req, next).await
+}
+
+/// Auth for `GET /v1/sandboxes/:id/pty`: an API key as on every route, or a
+/// terminal token for this one sandbox (see [`authenticate_terminal`]).
+async fn pty_auth_mw(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let bearer = bearer(&req);
+    let outcome = match authenticate(&state.store, bearer.as_deref()) {
+        AuthOutcome::Invalid => authenticate_terminal(
+            &state.store,
+            bearer.as_deref().unwrap_or_default(),
+            &id,
+            chrono::Utc::now().timestamp_millis(),
+        ),
+        other => other,
+    };
+    respond(outcome, req, next).await
+}
+
+fn bearer(req: &Request) -> Option<String> {
+    req.headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
-    match authenticate(&state.store, bearer.as_deref()) {
+        .map(|s| s.to_string())
+}
+
+async fn respond(outcome: AuthOutcome, mut req: Request, next: Next) -> Response {
+    match outcome {
         AuthOutcome::Ok(ctx) => {
             req.extensions_mut().insert(ctx);
             next.run(req).await

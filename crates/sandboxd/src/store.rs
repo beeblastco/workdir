@@ -233,6 +233,17 @@ impl Store {
         Ok(row.map(|d| serde_json::from_str(&d)).transpose()?)
     }
 
+    pub fn list_api_keys_for_org(&self, org_id: &str) -> Result<Vec<ApiKey>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT data FROM api_keys WHERE org_id = ?1")?;
+        let rows = stmt.query_map(params![org_id], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(serde_json::from_str(&r?)?);
+        }
+        Ok(out)
+    }
+
     // --- nodes ----------------------------------------------------------
 
     pub fn put_node(&self, node: &Node) -> Result<()> {
