@@ -1,5 +1,6 @@
 //! Shared application state handed to every request handler.
 
+use crate::auth::TerminalTokens;
 use crate::config::Config;
 use crate::node::{LocalNode, NodeClient};
 use crate::remote::RemoteNodeClient;
@@ -19,6 +20,8 @@ pub struct Inner {
     /// snapshot and overcommit a node (review #1). Held only across the short
     /// admission section, never across the VM boot.
     pub admission: tokio::sync::Mutex<()>,
+    /// Open one-time PTY tokens; memory only, never persisted.
+    pub terminal_tokens: TerminalTokens,
 }
 
 pub type AppState = Arc<Inner>;

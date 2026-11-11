@@ -1,18 +1,35 @@
 //! Interactive PTY endpoint (`GET /v1/sandboxes/:id/pty`, WebSocket). Bridges a
 //! client WebSocket to an in-sandbox shell session (spec §19, §20 "open PTY").
+//! `POST /v1/sandboxes/:id/pty-token` mints a one-time token for that route.
 
 use crate::api::load_owned;
 use crate::auth::AuthContext;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiResult};
 use crate::runtime::PtySession;
 use crate::state::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
+use axum::{Extension, Json};
 use futures::{SinkExt, StreamExt};
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+
+/// Mint a one-time terminal token for this sandbox, so a relay can open its PTY
+/// without holding the org's API key.
+pub async fn mint_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let sb = load_owned(&state, &ctx, &id)?;
+    let (token, expires_at) = state
+        .terminal_tokens
+        .mint(&sb.id, &sb.org_id, chrono::Utc::now())
+        .ok_or_else(|| ApiError::Rejected("too many open terminal tokens".into()))?;
+    Ok(Json(json!({"token": token, "expires_at": expires_at})))
+}
 
 pub async fn pty_ws(
     State(state): State<AppState>,

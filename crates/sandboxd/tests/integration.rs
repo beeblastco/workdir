@@ -1829,3 +1829,179 @@ async fn empty_pool_create_restores_from_golden_snapshot() {
         "an empty-pool create with a golden snapshot must restore, not cold boot: {paths:?}"
     );
 }
+
+/// Mints a one-time terminal token for `id` with `auth`, returning the response.
+async fn mint_pty_token(base: &str, id: &str, auth: &str) -> reqwest::Response {
+    client()
+        .post(format!("{base}/v1/sandboxes/{id}/pty-token"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn open_pty(
+    base: &str,
+    id: &str,
+    bearer: &str,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+    let mut request = format!("{}/v1/sandboxes/{id}/pty", base.replacen("http", "ws", 1))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
+    socket
+        .send(Message::Text("echo pty-$((40 + 2))\n".into()))
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("pty-42") {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("pty output")
+            .expect("pty open")
+            .unwrap();
+        seen.extend(msg.into_data());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn pty_accepts_a_minted_terminal_token_once_for_its_sandbox_only() {
+    let (base, key, _tmp) = spawn_server().await;
+    let c = client();
+    let auth = format!("Bearer {key}");
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let resp = c
+            .post(format!("{base}/v1/sandboxes"))
+            .header("authorization", &auth)
+            .send()
+            .await
+            .unwrap();
+        let sb: serde_json::Value = resp.json().await.unwrap();
+        ids.push(sb["id"].as_str().unwrap().to_string());
+    }
+    let (id, sibling) = (&ids[0], &ids[1]);
+    c.post(format!("{base}/v1/admin/orgs"))
+        .header("authorization", &auth)
+        .json(
+            &serde_json::json!({"id": "org_other", "name": "other", "prepaid_credits_usd": 100.0}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let resp = c
+        .post(format!("{base}/v1/admin/keys"))
+        .header("authorization", &auth)
+        .json(&serde_json::json!({
+            "org_id": "org_other",
+            "key_hash": sandboxd::auth::hash_key("sk_live_other"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let mint = |auth: String| {
+        let base = base.clone();
+        let id = id.clone();
+        async move {
+            let resp = mint_pty_token(&base, &id, &auth).await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["expires_at"].is_string());
+            body["token"].as_str().unwrap().to_string()
+        }
+    };
+    let token = mint(auth.clone()).await;
+    open_pty(&base, id, &token)
+        .await
+        .expect("a minted terminal token opens the PTY");
+    open_pty(&base, id, &key)
+        .await
+        .expect("an API key still opens the PTY");
+
+    let refused = |path: String, bearer: String| {
+        let c = c.clone();
+        async move {
+            let resp = c
+                .get(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .send()
+                .await
+                .unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let pty = |sandbox: &str| format!("{base}/v1/sandboxes/{sandbox}/pty");
+    let used = refused(pty(id), token.clone()).await;
+    assert_eq!(used.0, 401, "a token opens the PTY once");
+    let cases = [
+        ("other sandbox", pty(sibling), mint(auth.clone()).await),
+        ("unknown", pty(id), format!("wtt_{}", "0".repeat(64))),
+        ("malformed", pty(id), "not-a-token".to_string()),
+        (
+            "unknown sandbox",
+            pty("sbx_missing"),
+            mint(auth.clone()).await,
+        ),
+        (
+            "other route",
+            format!("{base}/v1/sandboxes/{id}"),
+            mint(auth.clone()).await,
+        ),
+        (
+            "other route",
+            format!("{base}/v1/sandboxes/{id}/pty-token"),
+            mint(auth.clone()).await,
+        ),
+    ];
+    for (name, path, bearer) in cases {
+        assert_eq!(
+            refused(path, bearer).await,
+            used,
+            "{name} must be refused exactly like a used token"
+        );
+    }
+
+    let other_org = mint_pty_token(&base, id, "Bearer sk_live_other").await;
+    assert_eq!(
+        other_org.status(),
+        404,
+        "another org cannot mint for a sandbox it does not own"
+    );
+
+    let other_auth = "Bearer sk_live_other";
+    let resp = c
+        .post(format!("{base}/v1/sandboxes"))
+        .header("authorization", other_auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let other_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = mint_pty_token(&base, &other_id, other_auth).await;
+    let token = resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.post(format!("{base}/v1/admin/orgs/org_other/suspend"))
+        .header("authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(pty(&other_id), token).await.0,
+        403,
+        "a suspended org's token is refused"
+    );
+}

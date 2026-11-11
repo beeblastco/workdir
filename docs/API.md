@@ -16,7 +16,8 @@ The default create is one call with no body and yields the cheapest, fastest pat
 | `POST` | `/v1/sandboxes/:id/exec` | `{cmd, cwd?, env?, background?}` → sync `{exit_code, stdout, stderr}` or, with `background: true`, `202 {cmd_id, state, status_url, logs_url}`. |
 | `GET` | `/v1/sandboxes/:id/exec/:cmd_id` | Poll background exec status → `{state, exit_code?, started_at, finished_at?, error?}`. |
 | `GET` | `/v1/sandboxes/:id/exec/:cmd_id/logs` | Fetch captured background exec output → `{stdout, stderr, truncated}`. |
-| `GET` | `/v1/sandboxes/:id/pty` | WebSocket interactive shell (a real in-guest TTY over vsock on Firecracker). |
+| `GET` | `/v1/sandboxes/:id/pty` | WebSocket interactive shell (a real in-guest TTY over vsock on Firecracker). Also takes a [terminal token](#terminal-tokens). |
+| `POST` | `/v1/sandboxes/:id/pty-token` | Mint a one-time [terminal token](#terminal-tokens) → `{token, expires_at}`. |
 | `GET` | `/v1/sandboxes/:id/metrics` | Working-set metrics: host RSS vs reserved shape, balloon target + guest memory stats, net counters. |
 | `GET` | `/v1/sandboxes/:id/files?path=…` | Read a file → `{content, encoding}`. |
 | `PUT` | `/v1/sandboxes/:id/files` | `{path, content, encoding?}` → write. |
@@ -28,6 +29,25 @@ The default create is one call with no body and yields the cheapest, fastest pat
 | `POST` | `/v1/sandboxes/:id/pause` | Stop (release CPU/mem; keep billing correct). |
 | `POST` | `/v1/sandboxes/:id/resume` | Resume from stopped disk/snapshot. |
 | `DELETE` | `/v1/sandboxes/:id` | Stop, delete ephemeral disk, remove routes. |
+
+### Terminal tokens
+
+`POST /v1/sandboxes/:id/pty-token` lets a relay open one sandbox's terminal without holding the
+org's API key. The caller's org must own the sandbox (another org gets `404`). The answer is
+`{"token": "wtt_…", "expires_at": "<RFC 3339>"}`.
+
+- Pass it as `Authorization: Bearer <token>` on `GET /v1/sandboxes/:id/pty` for that sandbox.
+  Its holder can run commands there, once, for up to two minutes.
+- It is random (32 bytes from the OS generator), lives 120 seconds (fixed by the host), and the
+  PTY upgrade that presents it uses it up, whether it is accepted or not.
+- It is held only in the server's memory: the database and its backups never see it, and a
+  restart forgets open tokens.
+- A used, expired, unknown or malformed token, a token for another sandbox, and an unknown
+  sandbox all get the same `401 unauthorized`. Every other route refuses it.
+- It is refused with `403` once the sandbox's org is suspended, and with `401` if the sandbox no
+  longer belongs to that org. It never carries admin scope.
+- An org holds at most 64 open tokens; minting past that answers `422 rejected` until some
+  expire or are used.
 
 ## Templates
 

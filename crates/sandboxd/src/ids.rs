@@ -1,7 +1,7 @@
 //! Short, prefixed identifiers (e.g. `sbx_3f9a1c2b`) matching the spec's
 //! `sbx_123` style, plus opaque tokens for API keys and node join.
 
-use rand::Rng;
+use rand::{Rng, RngCore};
 
 fn rand_hex(bytes: usize) -> String {
     let mut rng = rand::thread_rng();
@@ -59,6 +59,13 @@ pub fn volume_label(volume_id: &str) -> String {
 /// API key shown once to the caller. Stored only as a SHA-256 hash.
 pub fn api_key() -> String {
     format!("sk_live_{}", rand_hex(24))
+}
+
+/// One-time terminal token: 32 bytes straight from the OS generator.
+pub fn terminal_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("wtt_{}", hex::encode(bytes))
 }
 
 /// Node join token. Single control-plane secret, rotatable.
